@@ -5,11 +5,13 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import json
 import os
 from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +20,28 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+AUTH_STORE_PATH = current_dir / "auth.json"
+
+
+def load_auth_store():
+    if AUTH_STORE_PATH.exists():
+        with AUTH_STORE_PATH.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    return {
+        "teacher": {"password": "teacher123", "role": "teacher"},
+        "student": {"password": "student123", "role": "student"},
+    }
+
+
+AUTH_STORE = load_auth_store()
+
+TOKEN_STORE = {
+    "teacher-token": {"username": "teacher", "role": "teacher"},
+    "student-token": {"username": "student", "role": "student"},
+}
+
 
 # In-memory activity database
 activities = {
@@ -78,6 +102,26 @@ activities = {
 }
 
 
+def get_current_user(authorization: str | None = Header(default=None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if token not in TOKEN_STORE:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    return TOKEN_STORE[token]
+
+
+def require_teacher(user: dict = Depends(get_current_user)):
+    if user.get("role") != "teacher":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return user
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,9 +132,30 @@ def get_activities():
     return activities
 
 
+@app.post("/login")
+def login(username: str, password: str):
+    """Issue a bearer token for a known school account."""
+    credentials = AUTH_STORE.get(username)
+    if not credentials or credentials.get("password") != password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = f"{username}-token"
+    TOKEN_STORE[token] = {
+        "username": username,
+        "role": credentials.get("role", "student"),
+    }
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": TOKEN_STORE[token]["role"],
+    }
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, user: dict = Depends(require_teacher)):
     """Sign up a student for an activity"""
+    del user
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +176,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, user: dict = Depends(require_teacher)):
     """Unregister a student from an activity"""
+    del user
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
